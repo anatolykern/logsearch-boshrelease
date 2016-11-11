@@ -1,0 +1,541 @@
+---
+name: logsearch
+director_uuid: [TODO replace with output of bosh status --uuid]
+
+# logsearch bosh v2 manifest (https://bosh.io/docs/manifest-v2.html)
+# Assumtions - to be deployed on 192.168.0.0/24 network, exposed ports 514, 80, 8080, 9200
+# Using the following options from cloud-config:
+# small and medium vm_types, xlarge persistent disk type, default and default-vip networks, z1 azs
+# Replace TODO fields with options relevant to your environment
+# local static IP assignments:
+# 192.168.0.100 - ES master
+# 192.168.0.101/102 - ingestors
+# 192.168.0.103 - Redis queue
+# 192.168.0.105 - Kibana
+# 192.168.0.109 - Cluster monitor
+# 192.168.0.110 - HAproxy
+# Static IP assignments, that can be changed to dynamic (no cross references in configs):
+# 192.168.0.107/108 - ES data nodes
+# 192.168.0.106 - maintenance
+# 192.168.0.104 - ingestor-bosh-nats
+# 192.168.0.111/112 - parsers
+
+releases:
+- name: logsearch
+  version: latest
+
+stemcells:
+- alias: default
+  name: [TODO replace with ubuntu stemcell name from your bosh instance]
+  version: latest
+
+instance_groups:
+- name: elasticsearch_master
+  azs:
+  - z1
+  instances: 1
+  vm_type: medium
+  stemcell: default
+  networks:
+  - name: default
+    static_ips: &master_ips
+    - 192.168.0.100
+  persistent_disk_type: xlarge
+  jobs:
+  - name: elasticsearch
+    release: logsearch
+    properties:
+      elasticsearch:
+        node:
+          allow_data: false
+          allow_master: true
+        cluster_name: logsearch
+        exec: 
+        master_hosts: *master_ips
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/elasticsearch/elasticsearch.stdout.log"
+          service: elasticsearch
+        - file: "/var/vcap/sys/log/elasticsearch/elasticsearch.stderr.log"
+          service: elasticsearch
+  update:
+    max_in_flight: 1
+
+#collect all internal cluster logs in separate OIA ELK instance
+- name: cluster_monitor
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.109
+#must be static for cluster syslog_forwarder's
+  persistent_disk_type: xlarge
+
+  jobs:
+  - name: queue
+    release: logsearch
+  - name: parser
+    release: logsearch
+    properties:
+      logstash_parser:
+        debug: false 
+        filters:
+        - monitor: "/var/vcap/packages/logsearch-config/logstash-filters-monitor.conf"
+      logstash:
+        metadata_level: "DEBUG"
+        output:
+          elasticsearch:
+            data_hosts:
+            - 127.0.0.1
+      redis:
+        host: 127.0.0.1
+        maxmemory: 10
+  - name: ingestor_syslog
+    release: logsearch
+    properties:
+      logstash:
+        metadata_level: "DEBUG"
+      logstash_ingestor:
+        syslog:
+          port: 514
+        debug: false 
+      redis:
+        host: 127.0.0.1
+  - name: elasticsearch
+    release: logsearch
+    properties:
+      elasticsearch:
+        cluster_name: monitor
+        master_hosts:
+        - 127.0.0.1
+        node:
+          allow_data: true
+          allow_master: true
+  - name: elasticsearch_config
+    release: logsearch
+    properties:
+      elasticsearch_config:
+        elasticsearch:
+          host: 127.0.0.1
+          port: 9200
+        templates:
+        - shards-and-replicas: '{ "template" : "*", "order" : 99, "settings" : { "number_of_shards"
+            : 1, "number_of_replicas" : 0 } }'
+        - index_template: "/var/vcap/packages/logsearch-config/default-mappings.json"
+  - name: curator
+    release: logsearch
+    properties:
+      curator:
+        elasticsearch:
+          host: 127.0.0.1
+          port: 9200
+        purge_logs:
+          retention_period: 7
+  - name: kibana
+    release: logsearch
+    properties:
+      kibana:
+        elasticsearch:
+          host: 127.0.0.1
+          port: 9200
+        memory_limit: 30
+        port: 5601
+        wait_for_templates:
+        - shards-and-replicas
+  - name: nats_to_syslog
+    release: logsearch
+    properties:
+      nats_to_syslog:
+        debug: true
+        nats:
+          machines:
+          - [TODO replace with ip address of your local bosh instance, used for logsearch deploy]
+          password: nats-password
+          port: 4222
+          subject: ">"
+          user: nats
+        syslog:
+          host: 127.0.0.1
+          port: 514
+
+- name: queue
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.103
+  persistent_disk_type: xlarge
+  jobs:
+  - name: queue
+    release: logsearch
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/queue/queue.log"
+          service: queue_redis
+
+- name: maintenance
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.106
+  jobs:
+  - name: elasticsearch_config
+    release: logsearch
+    properties:
+      elasticsearch_config:
+        elasticsearch:
+          host: 192.168.0.100
+        templates:
+        - index_template: "/var/vcap/packages/logsearch-config/default-mappings.json"
+        - shards-and-replicas: '{ "template" : "*", "order" : 99, "settings" : { "number_of_shards"
+            : 5, "number_of_replicas" : 1 } }'
+  - name: curator
+    release: logsearch
+    properties:
+      elasticsearch:
+        host: 192.168.0.100
+        port: 9200
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/curator/curator.log"
+          service: curator
+        - file: "/var/vcap/sys/log/elasticsearch_config/job.control.log"
+          service: elasticsearch_config
+  update:
+    serial: true
+
+- name: elasticsearch_data
+  azs:
+  - z1
+  instances: 2
+  vm_type: medium
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.107
+    - 192.168.0.108
+  persistent_disk_type: xlarge
+  jobs:
+  - name: elasticsearch
+    release: logsearch
+    properties:
+      elasticsearch:
+        node:
+          allow_data: true
+          allow_master: false
+        cluster_name: logsearch
+        exec: 
+        master_hosts: *master_ips
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/elasticsearch/elasticsearch.stdout.log"
+          service: elasticsearch
+        - file: "/var/vcap/sys/log/elasticsearch/elasticsearch.stderr.log"
+          service: elasticsearch
+  update:
+    max_in_flight: 1
+
+- name: kibana
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.105
+  jobs:
+  - name: kibana
+    release: logsearch
+    properties:
+      kibana:
+        elasticsearch:
+          host: 192.168.0.100
+          port: 9200
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/kibana/kibana.stdout.log"
+          service: kibana
+        - file: "/var/vcap/sys/log/kibana/kibana.stderr.log"
+          service: kibana
+
+- name: ingestor
+  azs:
+  - z1
+  instances: 2
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips: &ingestors_ips
+    - 192.168.0.101
+    - 192.168.0.102
+  jobs:
+  - name: ingestor_syslog
+    release: logsearch
+    properties:
+      logstash:
+        metadata_level: "DEBUG"
+      logstash_ingestor:
+        debug: false
+      redis:
+        host: 192.168.0.103
+  - name: ingestor_relp
+    release: logsearch
+    properties:
+      logstash_ingestor:
+        debug: true 
+      redis:
+        host: 192.168.0.103
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/ingestor_syslog/ingestor_syslog.stdout.log"
+          service: ingestor_syslog
+        - file: "/var/vcap/sys/log/ingestor_syslog/ingestor_syslog.stderr.log"
+          service: ingestor_syslog
+
+- name: ingestor-bosh-nats
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.104
+  jobs:
+  - name: ingestor_syslog
+    release: logsearch
+    properties:
+      logstash:
+        metadata_level: "DEBUG"
+      logstash_ingestor:
+        debug: true
+      redis:
+        host: 192.168.0.103
+  - name: nats_to_syslog
+    release: logsearch
+    properties:
+      nats_to_syslog:
+        nats:
+          machines:
+          - [TODO replace with IP address of your nats CF partition, require opened firewall access on port 4222]
+          password: nats-password
+          user: nats
+        syslog:
+          host: 192.168.0.109
+          port: 514
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/nats_to_syslog/nats_to_syslog.stdout.log"
+          service: nats_to_syslog
+        - file: "/var/vcap/sys/log/nats_to_syslog/nats_to_syslog.stderr.log"
+          service: nats_to_syslog
+
+- name: parser
+  azs:
+  - z1
+  instances: 2
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+    static_ips:
+    - 192.168.0.111
+    - 192.168.0.112
+  jobs:
+  - name: parser
+    release: logsearch
+    properties:
+      logstash_parser:
+        filters: |
+          if [@type] == "metric" {
+            grok {
+              match => [ "@message", "%{NOTSPACE:name} %{NUMBER:value:float} %{INT:timestamp}" ]
+              tag_on_failure => [ "fail/metric" ]
+              add_tag => [ "metric" ]
+              remove_tag => "raw"
+              remove_field => [ "@message" ]
+            }
+
+            if "metric" in [tags] {
+              date {
+                match => [ "timestamp", "UNIX" ]
+                remove_field => "timestamp"
+              }
+            }
+          }
+        debug: false
+      logstash:
+        metadata_level: "NONE"
+        output:
+          elasticsearch:
+            data_hosts:
+            - 127.0.0.1
+      redis:
+        host: 192.168.0.103
+  - name: elasticsearch
+    release: logsearch
+    properties:
+      elasticsearch:
+        cluster_name: logsearch
+        exec: 
+        master_hosts:
+        - 192.168.0.100
+  - name: syslog_forwarder
+    release: logsearch
+    properties:
+      syslog_forwarder:
+        host: 192.168.0.109
+        port: 514
+        config:
+        - file: "/var/vcap/sys/log/elasticsearch/elasticsearch.stdout.log"
+          service: elasticsearch
+        - file: "/var/vcap/sys/log/elasticsearch/elasticsearch.stderr.log"
+          service: elasticsearch
+        - file: "/var/vcap/sys/log/parser/parser.stdout.log"
+          service: parser
+        - file: "/var/vcap/sys/log/parser/parser.stderr.log"
+          service: parser
+  update:
+    max_in_flight: 4
+    serial: false
+
+- name: ls-router
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  stemcell: default
+  networks:
+  - default:
+    - gateway
+    - dns
+    name: default
+    static_ips:
+    - 192.168.0.110
+  - name: default-vip
+    static_ips:
+    - [TODO replace with floating IP address]
+  jobs:
+  - name: haproxy
+    release: logsearch
+    properties:
+      haproxy:
+        cluster_monitor:
+          backend_servers:
+          - 192.168.0.109
+        ingestor:
+          inbound_port: 514
+#5514 in original release, changed per https://github.com/logsearch/logsearch-boshrelease/issues/200
+          backend_servers: *ingestors_ips
+        kibana:
+          inbound_port: 80
+          backend_port: 5601
+          backend_servers:
+          - 192.168.0.105
+          auth:
+            username: admin
+            password: admin
+        elastic:
+          auth:
+            username: admin
+            password: admin
+          inbound_port: 9200
+          backend_servers: *master_ips
+
+- name: enable_shard_allocation
+  azs:
+  - z1
+  instances: 1
+  lifecycle: errand
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+  jobs:
+  - name: enable_shard_allocation
+    release: logsearch
+    properties:
+      enable_shard_allocation:
+        elasticsearch:
+          master_node: 192.168.0.100
+
+- name: smoke-tests
+  azs:
+  - z1
+  instances: 1
+  lifecycle: errand
+  vm_type: small
+  stemcell: default
+  networks:
+  - name: default
+  jobs:
+  - name: smoke-tests
+    release: logsearch
+    properties:
+      smoke_tests:
+        elasticsearch_master:
+          host: 192.168.0.100
+        syslog_ingestor:
+          host: 192.168.0.110
+          port: 514
+
+update:
+  canaries: 1
+  canary_watch_time: 30000-600000
+  max_errors: 1
+  max_in_flight: 5
+  serial: false
+  update_watch_time: 5000-600000
